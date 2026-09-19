@@ -533,6 +533,41 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     await ctx2.fiber.dispose()
   })
 
+  it('refuses a log whose finished turn recorded a call with no result', async () => {
+    // A terminal scheduler failure closes the turn after its `tool/call` was
+    // recorded. Synthetic closers only reach an open tail, so every later
+    // request would replay a dangling call and be rejected; resume must report
+    // that by name instead.
+    const sessionId = SessionId('unclosed-call-resume')
+    const { ctx: ctx1, root } = await persistentHarness(new MockAdapter([]))
+    await seedStoredSession(ctx1, sessionId, [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: SessionSeq(1), time: 1, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: SessionSeq(2), time: 2, surfaceOp: 'append', data: {
+        turn: 1, step: 1,
+        stream: [],
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: ToolCallId('call-1'), name: 'bash', arguments: '{}' }],
+          source: { kind: 'model', provider: 'mock', model: 'mock' },
+        }),
+      } },
+      { type: 'tool/call', seq: SessionSeq(3), time: 2, data: { turn: 1, step: 1, callId: ToolCallId('call-1'), name: 'bash', arguments: '{}' } },
+      { type: 'step/end', seq: SessionSeq(4), time: 3, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: SessionSeq(5), time: 3, data: {
+        turn: 1,
+        reason: { kind: 'error', error: { message: 'scheduler exploded', code: 'UNKNOWN' } },
+      } },
+    ] as SessionEvent[])
+    await ctx1.fiber.dispose()
+
+    const ctx2 = await mountPersistentHarness(root, new MockAdapter([]))
+    await expect(ctx2.agents.resume({ resumeSessionId: sessionId })).rejects.toThrow(
+      'cannot resume session unclosed-call-resume: 1 recorded tool call(s) have no result inside a finished turn (first: call-1, turn 1, step 1)',
+    )
+    await ctx2.fiber.dispose()
+  })
+
   it('resume over a torn physical tail continues from the committed prefix', async () => {
     const sessionId = SessionId('torn-tail-resume')
     const root = await mkdtemp(join(tmpdir(), 'dsh-resume-torn-'))

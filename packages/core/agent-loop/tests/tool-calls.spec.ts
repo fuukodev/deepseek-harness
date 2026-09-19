@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, ToolCallId, StreamChunk  } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionEvent, SessionId, TOOL_OUTCOME_UNKNOWN } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import ToolRuntime, { defineContentToolFixture, TOOL_ABORTED_BEFORE_DISPATCH, TOOL_RUNTIME_SCHEDULER, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
@@ -702,6 +702,134 @@ describe('tool-call scheduler: failure quiescence', () => {
     expect(events(agent).findLast(event => event.type === 'turn/end')).toMatchObject({
       data: { reason: { kind: 'error', error: { message: schedulerError.message, code: 'UNKNOWN' } } },
     })
+    // Every recorded call is closed before the failed turn ends: a `tool/call`
+    // without a result would be replayed as a dangling provider call by every
+    // later request.
+    const results = events(agent).filter(event => event.type === 'tool/result')
+    expect(results.map(event => event.type === 'tool/result' && event.data.message.source.callId))
+      .toEqual(['c1', 'c2', 'c3'])
+    for (const result of results) {
+      expect(result).toMatchObject({
+        data: { error: { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN } },
+      })
+    }
+  })
+
+  it('answers a call whose prepare failed and keeps a settled sibling result', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+        { id: 'c3', name: 'p', args: { id: '3' } },
+      ]),
+    ])
+    const ctx = await harness(adapter, 3)
+    const gated = gatedParallelTool('p')
+    ctx.tools.register(gated.tool)
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const prepare = scheduler.prepare.bind(scheduler)
+    scheduler.prepare = async (exec) => {
+      if (exec.callId === ToolCallId('c2')) throw new Error('prepare exploded')
+      return prepare(exec)
+    }
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-prepare-failure'), { provider: 'mock', model: 'mock' })
+    const idlePromise = waitForIdle(ctx, agent)
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    // c1 is already dispatching when c2's prepare throws; c3 never starts.
+    await until(() => gated.started.includes('1'))
+    gated.release('1')
+    await idlePromise
+
+    const results = events(agent).filter(event => event.type === 'tool/result')
+    expect(results.map(event => event.type === 'tool/result' && event.data.message.source.callId))
+      .toEqual(['c1', 'c2'])
+    expect(results[0]).toMatchObject({ data: { message: { content: [{ content: [{ text: 'done-1' }] }] } } })
+    expect(results[1]).toMatchObject({
+      data: { error: { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN } },
+    })
+  })
+
+  it('falls back to an unknown-outcome result when the failing registry cannot finalize', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+      ]),
+    ])
+    const ctx = await harness(adapter, 2)
+    const gated = gatedParallelTool('p')
+    ctx.tools.register(gated.tool)
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const prepare = scheduler.prepare.bind(scheduler)
+    scheduler.prepare = async (exec) => {
+      if (exec.callId === ToolCallId('c2')) throw new Error('prepare exploded')
+      return prepare(exec)
+    }
+    scheduler.finalize = async () => { throw new Error('finalize exploded') }
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-finalize-failure'), { provider: 'mock', model: 'mock' })
+    const idlePromise = waitForIdle(ctx, agent)
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await until(() => gated.started.includes('1'))
+    gated.release('1')
+    await idlePromise
+
+    // The settled dispatch could not pass the broken post stage, so both
+    // recorded calls are answered as unknown rather than left dangling.
+    const results = events(agent).filter(event => event.type === 'tool/result')
+    expect(results.map(event => event.type === 'tool/result' && event.data.message.source.callId))
+      .toEqual(['c1', 'c2'])
+    for (const result of results) {
+      expect(result).toMatchObject({
+        data: { error: { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN } },
+      })
+    }
+  })
+
+  it('commits a settled dispatch that needs no post stage before answering the failed sibling', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+      ]),
+    ])
+    const ctx = await harness(adapter, 2)
+    ctx.tools.register(gatedParallelTool('p').tool)
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    let secondDispatched = false
+    let rejectFirst: ((error: Error) => void) | undefined
+    // c1's dispatch never resolves until the test fails it; c2's pipeline
+    // failure already IS a final result, so it keeps its own outcome.
+    scheduler.dispatch = (exec) => {
+      if (exec.callId === ToolCallId('c1')) {
+        return new Promise((_resolve, reject) => { rejectFirst = reject })
+      }
+      secondDispatched = true
+      return Promise.resolve({
+        kind: 'final-result',
+        result: {
+          content: [{ type: 'text', text: 'denied-1' }],
+          isError: true,
+          error: { message: 'denied', info: { name: 'DeniedError', code: 'DENIED' } },
+        },
+      })
+    }
+    const agent = await ctx.agentLoop.create(SessionId('scheduler-final-result-failure'), { provider: 'mock', model: 'mock' })
+    const idlePromise = waitForIdle(ctx, agent)
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await until(() => secondDispatched && rejectFirst !== undefined)
+    rejectFirst?.(new Error('dispatch exploded'))
+    await idlePromise
+
+    const results = events(agent).filter(event => event.type === 'tool/result')
+    expect(results.map(event => event.type === 'tool/result' && event.data.message.source.callId))
+      .toEqual(['c1', 'c2'])
+    expect(results[0]).toMatchObject({
+      data: { error: { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN } },
+    })
+    expect(results[1]).toMatchObject({ data: { error: { name: 'DeniedError', code: 'DENIED' } } })
   })
 })
 
