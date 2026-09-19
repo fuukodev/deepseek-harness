@@ -23,7 +23,7 @@ import type {
 } from '@deepseek-ai/dsh-agent'
 import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-settings'
-import { interruptedTurnClosers, SessionLogOffset, SessionPreparation, SessionSeq } from '@deepseek-ai/dsh-session'
+import { interruptedTurnClosers, SessionLogOffset, SessionPreparation, SessionSeq, unclosedToolCalls } from '@deepseek-ai/dsh-session'
 import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
@@ -906,6 +906,19 @@ export class AgentLoop extends Service implements AgentFactory {
           const persisted = coldRead.events
           const closers = interruptedTurnClosers(persisted)
           if (closers.length > 0) await handle.append(closers)
+          // Synthetic closers only reach a turn the crash left open. A call the
+          // log records without a result inside a finished turn cannot be
+          // answered by appending (its result would follow later messages), so
+          // refuse the log by name instead of serving a session whose every
+          // request the provider rejects.
+          const unclosed = unclosedToolCalls([...persisted, ...closers])
+          if (unclosed.length > 0) {
+            // oxlint-disable-next-line typescript/no-non-null-assertion -- guarded by the length check
+            const first = unclosed[0]!
+            throw new Error(
+              `cannot resume session ${id}: ${unclosed.length} recorded tool call(s) have no result inside a finished turn (first: ${first.callId}, turn ${first.turn}, step ${first.step}); every provider request would be rejected, so rewrite the session log to answer or remove those calls`,
+            )
+          }
           preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, {
             seed: [...persisted, ...closers],
             meta: structuredClone(handle.header),

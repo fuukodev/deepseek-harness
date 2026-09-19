@@ -151,7 +151,7 @@ session.deriveMessages()         // the derived model history
 
 #### 模型看到什么
 
-如果恢复发现 assistant 工具请求没有持久 `tool/call`，其合成 `TOOL_NOT_STARTED` 结果内容为 `The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.`。如果持久 `tool/call` 没有结果，其 `TOOL_OUTCOME_UNKNOWN` 结果内容为 `The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.`。
+如果恢复发现 assistant 工具请求没有持久 `tool/call`，其合成 `TOOL_NOT_STARTED` 结果内容为 `The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.`。如果持久 `tool/call` 没有结果，其 `TOOL_OUTCOME_UNKNOWN` 结果内容为 `The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.`。调度器故障在记录调用后关闭轮次时，也由同样这两段文本作答，因此同一种持久状态无论进程如何结束都读起来一致。收尾结果只回答仍在打开的尾轮中的调用：对于已完成轮次里没有结果的调用，`unclosedToolCalls` 会报告它，因为追加结果会使其排在后续消息之后，resume 也会按名称拒绝该日志。
 
 #### Token 影响
 

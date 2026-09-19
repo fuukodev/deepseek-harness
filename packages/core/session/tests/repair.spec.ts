@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ToolCallId , createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import { interruptedTurnClosers as repairInterruptedTurn, SessionSeq, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '../src/index.ts'
+import { interruptedTurnClosers as repairInterruptedTurn, SessionSeq, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, unclosedToolCalls as repairUnclosedToolCalls } from '../src/index.ts'
 import type { SessionEvent as LogicalSessionEvent, SurfaceEvent } from '../src/index.ts'
 
 interface SessionEvent {
@@ -14,6 +14,11 @@ interface SessionEvent {
 function interruptedTurnClosers(events: readonly SessionEvent[]): LogicalSessionEvent[] {
   for (const event of events) SessionSeq(event.seq)
   return repairInterruptedTurn(events as unknown as readonly LogicalSessionEvent[])
+}
+
+function unclosedToolCalls(events: readonly SessionEvent[]): ReturnType<typeof repairUnclosedToolCalls> {
+  for (const event of events) SessionSeq(event.seq)
+  return repairUnclosedToolCalls(events as unknown as readonly LogicalSessionEvent[])
 }
 
 /**
@@ -284,5 +289,71 @@ describe('interruptedTurnClosers', () => {
     const closers = interruptedTurnClosers(events)
     // No pending calls → no synthetic tool/result, just step/end + turn/end.
     expect(closers.map(e => e.type)).toEqual(['step/end', 'turn/end'])
+  })
+})
+
+describe('unclosedToolCalls', () => {
+  const assistantCall = (seq: number, id: string, turn = 1, step = 1): SessionEvent => ({
+    type: 'assistant/message', seq, time: seq, data: {
+      turn,
+      step,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: ToolCallId(id), name: 'bash', arguments: '{}' }],
+        source: { kind: 'model', provider: 'mock', model: 'mock' },
+      }),
+    },
+  })
+  const callStart = (seq: number, id: string, turn = 1, step = 1): SessionEvent => ({
+    type: 'tool/call', seq, time: seq, data: { turn, step, callId: ToolCallId(id), name: 'bash', arguments: '{}' },
+  })
+  const callResult = (seq: number, id: string, turn = 1, step = 1): SessionEvent => ({
+    type: 'tool/result', seq, time: seq, data: {
+      turn,
+      step,
+      message: createToolResultMessage({ callId: ToolCallId(id), content: [], isError: false }),
+    },
+  })
+
+  it('reports nothing when every recorded call has a result', () => {
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      assistantCall(1, 'call-1'),
+      callStart(2, 'call-1'),
+      callResult(3, 'call-1'),
+      { type: 'turn/end', seq: 4, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    expect(unclosedToolCalls(events)).toEqual([])
+  })
+
+  it('reports a recorded call left unanswered inside a finished turn', () => {
+    // The shape a terminal scheduler failure leaves behind: the turn closed,
+    // its recorded call never answered. Appending a result cannot fix it — the
+    // transcript order is decided by seq — so the caller must refuse the log.
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      assistantCall(1, 'call-1'),
+      callStart(2, 'call-1'),
+      { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'error', error: { message: 'boom', code: 'UNKNOWN' } } } },
+    ]
+    expect(unclosedToolCalls(events)).toEqual([{ callId: 'call-1', turn: 1, step: 1, callSeq: 2 }])
+  })
+
+  it('reports a requested call the Harness never recorded as started', () => {
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      assistantCall(1, 'call-1'),
+      { type: 'turn/end', seq: 2, time: 2, data: { turn: 1, reason: { kind: 'interrupted' } } },
+    ]
+    expect(unclosedToolCalls(events)).toEqual([{ callId: 'call-1', turn: 1, step: 1 }])
+  })
+
+  it('ignores a tool/call that no assistant message requested', () => {
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      callStart(1, 'orphan'),
+      { type: 'turn/end', seq: 2, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    expect(unclosedToolCalls(events)).toEqual([])
   })
 })

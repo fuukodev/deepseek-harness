@@ -5,14 +5,16 @@
  * model-ordered. Abort or an internal scheduler failure stops replenishment
  * and drains started calls.
  *
- * Abort records synthetic error results for skipped calls so replay stays
- * valid. A terminal scheduler failure preserves already-recorded `tool/call`
- * events without fabricating results.
+ * Abort and a terminal scheduler failure close every call the failed group
+ * already recorded: a durable `tool/call` without a matching result makes the
+ * log provider-invalid for every later request, and crash repair cannot answer
+ * that call once the failed turn has closed.
  * @module dsh-agent-loop/tool-calls
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { createToolResultMessage, type ToolCallBlock } from '@deepseek-ai/dsh-llm'
+import { TOOL_OUTCOME_UNKNOWN, TOOL_OUTCOME_UNKNOWN_TEXT } from '@deepseek-ai/dsh-session'
 import type { Session, SessionSeq, UserMessage } from '@deepseek-ai/dsh-session'
 import { TOOL_ABORTED_BEFORE_DISPATCH, TOOL_RUNTIME_SCHEDULER, type ToolExecutionInput, type ToolExecutionMode, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
@@ -45,8 +47,8 @@ interface GroupOutcome {
  * the signal still aborted after accepting started-call context through the
  * caller-supplied acceptor (the machine stages it in its next-step inbox for the
  * step boundary). An internal scheduler failure stops new dispatches, drains
- * already-started dispatches, and rejects with the first failure without
- * fabricating tool results.
+ * already-started dispatches, records an unknown-outcome result for every call
+ * those stages left unanswered, and rejects with the first failure.
  * The committed step's AgentLoop driver boundary supplies the initiating Agent
  * that becomes each explicit {@link ToolExecutionInput.agent}.
  *
@@ -154,9 +156,11 @@ async function runGroup(
         : ctx.tools[TOOL_RUNTIME_SCHEDULER].finish(slot.exec, slot.result)
       // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded index
       appendToolResult(session, turn, step, call!.block, result, callSeqs[committed]!)
+      // The cursor advances with the append: a failure while accepting this
+      // batch's context must not let the failure path append this result twice.
+      committed++
       for (const context of result.additionalContexts ?? []) acceptContext(context)
       concluded ||= result.concludesTurn === true
-      committed++
     }
   }
 
@@ -213,6 +217,37 @@ async function runGroup(
     }
   }
 
+  /**
+   * Close every recorded call the failed group would otherwise leave
+   * unanswered, in model order. A settled dispatch keeps its real result when
+   * the failing registry can still finalize it; a call that never returned a
+   * dispatch outcome receives the unknown-outcome result the crash path uses.
+   */
+  const closeRecordedCalls = async (): Promise<void> => {
+    for (let index = committed; index < group.length; index++) {
+      const callSeq = callSeqs[index]
+      if (callSeq === undefined) continue
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded index
+      const call = group[index]!
+      const slot = slots[index]
+      let result: ToolExecutionResult
+      if (slot === undefined) {
+        result = unknownOutcomeResult()
+      } else {
+        try {
+          result = slot.needsPost
+            ? await ctx.tools[TOOL_RUNTIME_SCHEDULER].finalize(slot.exec, slot.result)
+            : ctx.tools[TOOL_RUNTIME_SCHEDULER].finish(slot.exec, slot.result)
+        } catch {
+          // A registry that failed prepare or dispatch can fail the post stage
+          // too; the recorded call still needs a result of its own.
+          result = unknownOutcomeResult()
+        }
+      }
+      appendToolResult(session, turn, step, call.block, result, callSeq)
+    }
+  }
+
   // Ordered pre-execute may await; only dispatch/body overlaps. A scheduler
   // failure stops new dispatches and reaches the turn boundary after every
   // already-started dispatch settles.
@@ -232,6 +267,7 @@ async function runGroup(
   } catch (error: unknown) {
     schedulerFailure ??= { error }
     await Promise.allSettled(inFlight.values())
+    await closeRecordedCalls()
     throw schedulerFailure.error
   }
 
@@ -257,6 +293,23 @@ function appendSkippedToolCall(session: Session, turn: number, step: number, blo
       info: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH },
     },
   }, callSeq)
+}
+
+/**
+ * Result for a recorded call whose outcome no stage of the failed group could
+ * report. It carries the same code and model-visible text as the crash-repair
+ * result for the same durable situation, so the model reads one wording whether
+ * the process died or the scheduler failed.
+ */
+function unknownOutcomeResult(): ToolExecutionResult {
+  return {
+    content: [{ type: 'text', text: TOOL_OUTCOME_UNKNOWN_TEXT }],
+    isError: true,
+    error: {
+      message: 'tool outcome was not recorded',
+      info: { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN },
+    },
+  }
 }
 
 /** Append a started call and return the event seq that its result must cite. */

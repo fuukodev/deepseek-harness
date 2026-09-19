@@ -1,7 +1,9 @@
 /**
  * Crash-recovery repair for an interrupted session log. It preserves a fully
  * written final turn and supplies the missing tool, step, and turn boundaries
- * needed to resume with a provider-valid transcript.
+ * needed to resume with a provider-valid transcript; a log whose finished turns
+ * already contain an unanswered tool call is reported as unrepairable rather
+ * than silently served.
  * @module @deepseek-ai/dsh-session/repair
  */
 
@@ -16,6 +18,71 @@ export const TOOL_NOT_STARTED = 'TOOL_NOT_STARTED'
 
 /** Recovery code for a recorded tool call whose completed outcome was not durably recorded. */
 export const TOOL_OUTCOME_UNKNOWN = 'TOOL_OUTCOME_UNKNOWN'
+
+/**
+ * Model-visible result text for a call the Harness never recorded as started.
+ * Shared with the agent loop so both recovery routes present one wording.
+ */
+export const TOOL_NOT_STARTED_TEXT =
+  'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.'
+
+/**
+ * Model-visible result text for a recorded call whose outcome was never durably
+ * recorded. Shared with the agent loop so both recovery routes present one wording.
+ */
+export const TOOL_OUTCOME_UNKNOWN_TEXT =
+  'The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.'
+
+/** One recorded tool call that never received a durable result. */
+export interface UnclosedToolCall {
+  /** Assistant-visible call identity. */
+  readonly callId: ToolCallId
+  /** Turn that recorded the call or its request. */
+  readonly turn: number
+  /** Step that recorded the call or its request. */
+  readonly step: number
+  /** Seq of the `tool/call` event when the Harness recorded the call start; absent when only the request was recorded. */
+  readonly callSeq?: SessionSeqType
+}
+
+/**
+ * List every tool call the log records without a matching `tool/result`, in log
+ * order. Unlike {@link interruptedTurnClosers}, this scans the whole log rather
+ * than the open tail: a call left unanswered inside a finished turn cannot be
+ * closed by appending (the result would follow later messages), so a caller that
+ * must serve a provider-valid transcript has to refuse the log instead.
+ *
+ * @param events - the durable log to scan, alone or already extended with synthetic closers.
+ * @returns one entry per unclosed call, in the order the calls appear.
+ */
+export function unclosedToolCalls(events: readonly SessionEvent[]): UnclosedToolCall[] {
+  const pending = new Map<ToolCallId, UnclosedToolCall>()
+  for (const event of events) {
+    switch (event.type) {
+      case 'assistant/message':
+        for (const block of event.data.message.content) {
+          if (block.type === 'tool-call') {
+            pending.set(block.id, { callId: block.id, turn: event.data.turn, step: event.data.step })
+          }
+        }
+        break
+      case 'tool/call': {
+        const request = pending.get(event.data.callId)
+        if (request) {
+          pending.set(event.data.callId, { ...request, callSeq: event.seq })
+        }
+        break
+      }
+      case 'tool/result':
+        pending.delete(event.data.message.source.callId)
+        break
+      // Other event types carry no call boundary.
+      default:
+        break
+    }
+  }
+  return [...pending.values()]
+}
 
 /**
  * Return deterministic synthetic events that close an open tail turn. Unmatched
@@ -102,9 +169,7 @@ export function interruptedTurnClosers(events: readonly SessionEvent[]): Session
         isError: true,
         content: [{
           type: 'text',
-          text: started
-            ? 'The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.'
-            : 'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.',
+          text: started ? TOOL_OUTCOME_UNKNOWN_TEXT : TOOL_NOT_STARTED_TEXT,
         }],
       }],
     })
