@@ -11,6 +11,7 @@ import {
   probeCurrentTokenJobSupport,
 } from '@deepseek-ai/dsh-win32-process'
 import type { BoundProcessOwner, ManagedProcessLaunch } from './managed-owner.ts'
+import type { SpawnProcess } from './spawn.ts'
 import {
   type SerializedRunnerError,
   type WindowsRunnerResult,
@@ -28,7 +29,7 @@ import type { RunnerInvocation } from './runner-launch.ts'
 
 /** Test seams for runner launch and dynamic capability checks. */
 export interface WindowsJobInternals {
-  spawn?: typeof spawn
+  spawn?: SpawnProcess
   runnerInvocation?: RunnerInvocation
   resolveRunnerInvocation?: () => RunnerInvocation
   runnerAvailable?: (invocation: RunnerInvocation) => boolean

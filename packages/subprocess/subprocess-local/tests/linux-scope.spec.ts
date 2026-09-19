@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events'
-import { existsSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
@@ -10,6 +12,7 @@ import {
   probeLinuxManager,
   probeLinuxNative,
   probeLinuxScope,
+  resolveLinuxScopeInternals,
   signalLinuxDirectProcess,
 } from '../src/linux-scope.ts'
 import type { LinuxScopeInternals } from '../src/linux-scope.ts'
@@ -217,6 +220,48 @@ describe('Linux native capability selection', () => {
       runnerInvocation: [process.execPath],
       runnerAvailable: () => true,
     })).toBe(process.platform !== 'win32')
+  })
+
+  it.skipIf(process.platform === 'win32')('resolves default Linux manager commands before native launch', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-linux-command-'))
+    const nonFileDirectory = mkdtempSync(join(tmpdir(), 'dsh-linux-command-non-file-'))
+    const missingDirectory = mkdtempSync(join(tmpdir(), 'dsh-linux-command-missing-'))
+    directories.push(directory, nonFileDirectory, missingDirectory)
+    for (const command of ['systemd-run', 'systemctl']) {
+      const path = join(directory, command)
+      writeFileSync(path, '')
+      chmodSync(path, 0o700)
+      mkdirSync(join(nonFileDirectory, command))
+    }
+    const previousPath = process.env.PATH
+    try {
+      vi.stubEnv('PATH', [join(nonFileDirectory, 'missing'), nonFileDirectory, directory].join(delimiter))
+      expect(resolveLinuxScopeInternals()).toMatchObject({
+        systemdRun: join(directory, 'systemd-run'),
+        systemctl: join(directory, 'systemctl'),
+      })
+      expect(resolveLinuxScopeInternals({
+        systemdRun: 'custom-systemd-run',
+        systemctl: 'custom-systemctl',
+      })).toMatchObject({ systemdRun: 'custom-systemd-run', systemctl: 'custom-systemctl' })
+      expect(resolveLinuxScopeInternals({
+        systemdRun: join(directory, 'systemd-run'),
+        systemctl: join(directory, 'systemctl'),
+      })).toMatchObject({
+        systemdRun: join(directory, 'systemd-run'),
+        systemctl: join(directory, 'systemctl'),
+      })
+      vi.stubEnv('PATH', missingDirectory)
+      expect(resolveLinuxScopeInternals()).toBeUndefined()
+      vi.stubEnv('PATH', undefined)
+      expect(resolveLinuxScopeInternals({
+        systemdRun: 'custom-systemd-run',
+        systemctl: 'custom-systemctl',
+      })).toMatchObject({ systemdRun: 'custom-systemd-run', systemctl: 'custom-systemctl' })
+    } finally {
+      if (previousPath === undefined) vi.stubEnv('PATH', undefined)
+      else vi.stubEnv('PATH', previousPath)
+    }
   })
 
   it('keeps quieting on the transient-scope probe but preserves manager diagnostics', () => {
@@ -1037,7 +1082,7 @@ describe('Linux ordinary launch adapters', () => {
     const requestPath = options?.env?.[SUBPROCESS_RUNNER_ENV]
     if (requestPath === undefined) throw new Error('launch did not publish a request locator')
     directories.push(linuxLaunchFilesFromLocator(requestPath).directory)
-    expect(call?.[0]).toBe('systemd-run')
+    expect(call?.[0]).toMatch(/(?:^|[/\\])systemd-run$/u)
     expect(consumeLinuxLaunchRequest(requestPath)).toEqual({ cwd: '/target', env: { TARGET: 'yes' } })
     child.exit(0, null)
     await expect(result.direct).resolves.toEqual({ exitCode: 0, signal: null })
