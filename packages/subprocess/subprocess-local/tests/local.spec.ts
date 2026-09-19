@@ -554,6 +554,7 @@ describe('LocalSubprocessRuntime', () => {
       prepareLinuxTerminalScope,
       probeLinuxManager,
       probeLinuxNative,
+      resolveLinuxScopeInternals: (internals: object) => internals,
     }))
     let fiber: { dispose(): Promise<void> } | undefined
     try {
@@ -579,6 +580,7 @@ describe('LocalSubprocessRuntime', () => {
       expect(prepareLinuxTerminalScope).toHaveBeenCalledWith(
         expect.objectContaining({ argv: ['shell', '--literal'] }),
         expect.objectContaining({ PWD: targetCwd, TERM: 'dumb', TARGET_VALUE: 'preserved' }),
+        expect.objectContaining(runtime.internals),
       )
       expect(nodePtySpawn).toHaveBeenCalledWith(
         '/usr/bin/systemd-run',
@@ -655,6 +657,7 @@ describe('LocalSubprocessRuntime', () => {
       prepareLinuxTerminalScope,
       probeLinuxManager: () => true,
       probeLinuxNative: () => true,
+      resolveLinuxScopeInternals: (internals: object) => internals,
     }))
     let fiber: { dispose(): Promise<void> } | undefined
     try {
@@ -828,6 +831,7 @@ describe('LocalSubprocessRuntime', () => {
       prepareLinuxTerminalScope: vi.fn(),
       probeLinuxManager,
       probeLinuxNative,
+      resolveLinuxScopeInternals: (internals: object) => internals,
     }))
     vi.doMock('../src/windows-job.ts', () => ({ launchWindowsJob, probeWindowsJob }))
     vi.doMock('../src/spawn.ts', async importOriginal => ({
@@ -855,8 +859,23 @@ describe('LocalSubprocessRuntime', () => {
       await linuxRuntime.spawn(spec('true')).done
       await new Promise(resolve => setImmediate(resolve))
       expect(probeLinuxNative).toHaveBeenCalledOnce()
+      expect(probeLinuxNative).toHaveBeenCalledWith(expect.objectContaining(linuxRuntime.internals))
       expect(probeLinuxManager).toHaveBeenCalledTimes(2)
+      expect(probeLinuxManager).toHaveBeenNthCalledWith(1, expect.objectContaining(linuxRuntime.internals))
+      expect(probeLinuxManager).toHaveBeenNthCalledWith(2, expect.objectContaining(linuxRuntime.internals))
       expect(launchLinuxScope).toHaveBeenCalledTimes(2)
+      expect(launchLinuxScope).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining(linuxRuntime.internals),
+      )
+      expect(launchLinuxScope).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining(linuxRuntime.internals),
+      )
 
       const windowsContext = new Context()
       const windowsFiber = await windowsContext.plugin(IsolatedLocalSubprocessRuntime)
@@ -891,6 +910,7 @@ describe('LocalSubprocessRuntime', () => {
       .mockReturnValueOnce(false)
       .mockReturnValueOnce(false)
       .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
     const probeLinuxManager = vi.fn()
       .mockReturnValueOnce(false)
       .mockReturnValueOnce(true)
@@ -907,6 +927,7 @@ describe('LocalSubprocessRuntime', () => {
       prepareLinuxTerminalScope: vi.fn(),
       probeLinuxManager,
       probeLinuxNative,
+      resolveLinuxScopeInternals: (internals: object) => internals,
     }))
     vi.doMock('../src/windows-job.ts', () => ({ launchWindowsJob: vi.fn(), probeWindowsJob }))
     const fibers: Array<{ dispose(): Promise<void> }> = []
@@ -928,7 +949,13 @@ describe('LocalSubprocessRuntime', () => {
       expect(linuxSelect('ordinary')).toBe('linux-scope')
       expect(linuxSelect('ordinary')).toBe('fallback')
       expect(linuxSelect('ordinary')).toBe('linux-scope')
-      expect(probeLinuxNative).toHaveBeenCalledTimes(4)
+      linuxRuntime.internals = {
+        platform: 'linux',
+        systemdRun: '/new/systemd-run',
+        systemctl: '/new/systemctl',
+      }
+      expect(linuxSelect('ordinary')).toBe('linux-scope')
+      expect(probeLinuxNative).toHaveBeenCalledTimes(5)
       expect(probeLinuxManager).toHaveBeenCalledTimes(2)
 
       const windowsContext = new Context()

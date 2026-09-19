@@ -38,9 +38,12 @@ import {
   prepareLinuxTerminalScope,
   probeLinuxManager,
   probeLinuxNative,
+  resolveLinuxScopeInternals,
   signalLinuxDirectProcess,
 } from './linux-scope.ts'
+import type { LinuxScopeInternals } from './linux-scope.ts'
 import { launchWindowsJob, probeWindowsJob } from './windows-job.ts'
+import type { WindowsJobInternals } from './windows-job.ts'
 import { targetEnvironment } from './runner-launch.ts'
 import { createProcessInspector } from './process-inspector.ts'
 import type { ProcessInspector } from './process-inspector.ts'
@@ -48,6 +51,10 @@ import { LocalTerminalHandle } from './terminal.ts'
 import { prepareShellActivity } from './shell-activity.ts'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
+
+type LocalSubprocessInternals = SpawnInternals
+  & Omit<LinuxScopeInternals, 'spawn'>
+  & Omit<WindowsJobInternals, 'spawn'>
 
 /**
  * Local subprocess service: platform-selected managed ranges, Node-shaped stdio
@@ -63,12 +70,16 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private terminals = new Set<LocalTerminalHandle>()
   /** Caller endpoints retained until close, independently of managed process lifetime. */
   private controlChannels = new Set<Duplex>()
-  /** Test hook: process, spill, and platform operations forwarded to spawnSubprocess. */
-  internals: SpawnInternals = {}
+  /** Test hook: process, native-owner, spill, and platform operations. */
+  internals: LocalSubprocessInternals = {}
+  /** Absolute Linux manager commands selected for the current native probe. */
+  private linuxScopeInternals: LinuxScopeInternals | undefined
   /** Provider-lifetime latch suppressing repeated weaker-containment warnings. */
   private fallbackWarningIssued = false
   /** Positive-only cache for the expensive Linux bootstrap and scope probe. */
   private linuxDeepProbePassed = false
+  /** Manager commands covered by the positive Linux deep probe. */
+  private linuxDeepProbeCommands: { systemdRun: string | undefined; systemctl: string | undefined } | undefined
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
 
@@ -186,8 +197,8 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     } else {
       const binding = prepareManagedProcessBinding(this.internals)
       const launch = containmentMode === 'linux-scope'
-        ? launchLinuxScope(spec, env)
-        : launchWindowsJob(spec, env)
+        ? launchLinuxScope(spec, env, this.linuxScopeInternals ?? this.internals)
+        : launchWindowsJob(spec, env, this.internals)
       handle = bindManagedProcess(spec, launch, binding)
     }
     this.live.add(handle)
@@ -212,15 +223,30 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     const platform = this.internals.platform ?? process.platform
     let fallbackReason: string | undefined
     if (platform === 'linux') {
-      const available = this.linuxDeepProbePassed
-        ? probeLinuxManager()
-        : probeLinuxNative()
-      if (available) this.linuxDeepProbePassed = true
+      const nativeInternals = resolveLinuxScopeInternals(this.internals)
+      this.linuxScopeInternals = nativeInternals
+      const sameDeepProbeCommands = nativeInternals !== undefined
+        && this.linuxDeepProbeCommands?.systemdRun === nativeInternals.systemdRun
+        && this.linuxDeepProbeCommands?.systemctl === nativeInternals.systemctl
+      const available = nativeInternals !== undefined && (
+        this.linuxDeepProbePassed && sameDeepProbeCommands
+          ? probeLinuxManager(nativeInternals)
+          : probeLinuxNative(nativeInternals)
+      )
+      if (available) {
+        this.linuxDeepProbePassed = true
+        this.linuxDeepProbeCommands = {
+          systemdRun: nativeInternals.systemdRun,
+          systemctl: nativeInternals.systemctl,
+        }
+      }
       if (available) return 'linux-scope'
       fallbackReason = 'the current user-systemd scope or private bootstrap is unavailable'
+    } else {
+      this.linuxScopeInternals = undefined
     }
     if (kind === 'ordinary' && platform === 'win32') {
-      const available = probeWindowsJob()
+      const available = probeWindowsJob(this.internals)
       if (available) return 'windows-job'
     }
     this.warnFallback(platform, kind, fallbackReason)
@@ -279,7 +305,11 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     let terminal: NodePty.IPty
     try {
       scope = containmentMode === 'linux-scope'
-        ? prepareLinuxTerminalScope(launch, { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType })
+        ? prepareLinuxTerminalScope(
+          launch,
+          { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType },
+          this.linuxScopeInternals ?? this.internals,
+        )
         : undefined
       if (scope !== undefined) { options.cwd = scope.cwd; options.env = scope.env }
       terminal = requireNodePty().spawn(

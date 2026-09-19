@@ -27,7 +27,7 @@ import { SUBPROCESS_CONTROL_FD } from '@deepseek-ai/dsh-subprocess/control'
 import { linuxProcessGroupHasLiveMembers } from './process-inspector.ts'
 import { OutputCollector, prepareManagedProcessBinding } from './output.ts'
 
-type SpawnProcess = (
+export type SpawnProcess = (
   program: string,
   args: readonly string[],
   options: SpawnOptions,

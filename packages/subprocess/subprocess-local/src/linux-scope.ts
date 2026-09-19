@@ -3,7 +3,8 @@
 import { controlPipe } from './control-spawn.ts'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs'
+import { delimiter, isAbsolute, resolve } from 'node:path'
 import { setTimeout as sleepMs } from 'node:timers/promises'
 import type {
   SubprocessOutcome,
@@ -12,6 +13,7 @@ import type {
 } from '@deepseek-ai/dsh-subprocess'
 import { loadLinuxExecve } from './linux-execve.ts'
 import type { BoundProcessOwner, ManagedProcessLaunch } from './managed-owner.ts'
+import type { SpawnProcess } from './spawn.ts'
 import {
   cleanupLinuxLaunchFiles,
   createLinuxLaunchFiles,
@@ -28,9 +30,9 @@ import {
 import type { RunnerInvocation } from './runner-launch.ts'
 import { childEnv } from './spawn.ts'
 
-/** Test seams for systemd command execution. */
+/** Linux manager command and process seams. */
 export interface LinuxScopeInternals {
-  spawn?: typeof spawn
+  spawn?: SpawnProcess
   spawnSync?: typeof spawnSync
   systemctlQuery?: (command: string, args: readonly string[]) => Promise<SystemctlResult>
   systemdRun?: string
@@ -51,6 +53,8 @@ interface SystemctlResult {
 
 const SYSTEMCTL_TIMEOUT_MS = 5_000
 const SCOPE_INITIAL_POLL_INTERVAL_MS = 50
+/** Node's Unix default when an explicit child environment omits PATH. */
+const DEFAULT_LINUX_EXEC_PATH = '/usr/bin:/bin'
 const MISSING_UNIT = /\bunit\b[^\r\n]*(?:could not be found|not found|not loaded)/iu
 
 function managerEnvironment(): NodeJS.ProcessEnv {
@@ -61,6 +65,45 @@ function managerEnvironment(): NodeJS.ProcessEnv {
 
 function quietSystemdEnvironment(): NodeJS.ProcessEnv {
   return childEnv({ LC_ALL: 'C', SYSTEMD_LOG_TARGET: 'null' })
+}
+
+function resolveLinuxExecutable(command: string, environment: NodeJS.ProcessEnv): string | undefined {
+  if (isAbsolute(command)) return command
+  const path = environment.PATH ?? DEFAULT_LINUX_EXEC_PATH
+  for (const directory of path.split(delimiter)) {
+    const candidate = resolve(process.cwd(), directory, command)
+    try {
+      if (!statSync(candidate).isFile()) continue
+      accessSync(candidate, fsConstants.X_OK)
+      return candidate
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return undefined
+}
+
+function configuredLinuxExecutable(command: string, environment: NodeJS.ProcessEnv): string {
+  return resolveLinuxExecutable(command, environment) ?? command
+}
+
+/**
+ * Resolve the native Linux manager commands before a scope is selected.
+ * @param internals - existing process seams and optional manager command overrides.
+ * @returns internals with absolute manager commands, or undefined when the default commands are unavailable.
+ */
+export function resolveLinuxScopeInternals(
+  internals: LinuxScopeInternals = {},
+): LinuxScopeInternals | undefined {
+  const environment = quietSystemdEnvironment()
+  const systemdRun = internals.systemdRun === undefined
+    ? resolveLinuxExecutable('systemd-run', environment)
+    : configuredLinuxExecutable(internals.systemdRun, environment)
+  const systemctl = internals.systemctl === undefined
+    ? resolveLinuxExecutable('systemctl', environment)
+    : configuredLinuxExecutable(internals.systemctl, environment)
+  if (systemdRun === undefined || systemctl === undefined) return undefined
+  return { ...internals, systemdRun, systemctl }
 }
 
 function querySystemctl(command: string, args: readonly string[]): Promise<SystemctlResult> {
@@ -111,22 +154,27 @@ export function probeLinuxBootstrap(internals: LinuxScopeInternals = {}): boolea
  * @returns whether the current user manager supports the required scope invocation.
  */
 export function probeLinuxScope(internals: LinuxScopeInternals = {}): boolean {
+  const environment = quietSystemdEnvironment()
   const unitBase = unitStem('dsh-subprocess-probe')
-  const result = (internals.spawnSync ?? spawnSync)(internals.systemdRun ?? 'systemd-run', [
-    '--user',
-    '--scope',
-    '--quiet',
-    '--collect',
-    '--expand-environment=no',
-    `--unit=${unitBase}`,
-    '--',
-    internals.systemctl ?? 'systemctl',
-    '--user',
-    'show',
-    `${unitBase}.scope`,
-    '--property=ActiveState',
-    '--value',
-  ], { env: quietSystemdEnvironment(), stdio: 'ignore', timeout: SYSTEMCTL_TIMEOUT_MS })
+  const result = (internals.spawnSync ?? spawnSync)(
+    configuredLinuxExecutable(internals.systemdRun ?? 'systemd-run', environment),
+    [
+      '--user',
+      '--scope',
+      '--quiet',
+      '--collect',
+      '--expand-environment=no',
+      `--unit=${unitBase}`,
+      '--',
+      configuredLinuxExecutable(internals.systemctl ?? 'systemctl', environment),
+      '--user',
+      'show',
+      `${unitBase}.scope`,
+      '--property=ActiveState',
+      '--value',
+    ],
+    { env: environment, stdio: 'ignore', timeout: SYSTEMCTL_TIMEOUT_MS },
+  )
   return result.error === undefined && result.status === 0
 }
 
@@ -136,12 +184,17 @@ export function probeLinuxScope(internals: LinuxScopeInternals = {}): boolean {
  * @returns whether one lightweight manager query succeeds.
  */
 export function probeLinuxManager(internals: LinuxScopeInternals = {}): boolean {
-  const result = (internals.spawnSync ?? spawnSync)(internals.systemctl ?? 'systemctl', [
-    '--user',
-    'show',
-    '--property=Version',
-    '--value',
-  ], { env: managerEnvironment(), stdio: 'ignore', timeout: SYSTEMCTL_TIMEOUT_MS })
+  const environment = managerEnvironment()
+  const result = (internals.spawnSync ?? spawnSync)(
+    configuredLinuxExecutable(internals.systemctl ?? 'systemctl', environment),
+    [
+      '--user',
+      'show',
+      '--property=Version',
+      '--value',
+    ],
+    { env: environment, stdio: 'ignore', timeout: SYSTEMCTL_TIMEOUT_MS },
+  )
   return result.error === undefined && result.status === 0
 }
 
@@ -533,16 +586,19 @@ export function prepareLinuxTerminalScope(
   const files = createLinuxLaunchFiles({ cwd: spec.cwd, env: targetEnv })
   const startup = new LinuxScopeStartup(files, 'terminal')
   const unitBase = unitStem('dsh-terminal')
+  const environment = runnerEnvironment(files.requestPath, invocation)
+  const systemdRun = configuredLinuxExecutable(internals.systemdRun ?? 'systemd-run', environment)
+  const systemctl = configuredLinuxExecutable(internals.systemctl ?? 'systemctl', environment)
   return {
-    command: internals.systemdRun ?? 'systemd-run',
+    command: systemdRun,
     args: scopeArgs(unitBase, invocation, spec.argv),
     cwd: process.cwd(),
-    env: runnerEnvironment(files.requestPath, invocation),
+    env: environment,
     bindOwner: direct => new SystemdScopeOwner(
       `${unitBase}.scope`,
       startup,
       direct,
-      internals.systemctl ?? 'systemctl',
+      systemctl,
       internals.spawnSync ?? spawnSync,
       internals.systemctlQuery ?? querySystemctl,
       internals.sleep ?? sleepWithAbort,
@@ -571,15 +627,18 @@ export function launchLinuxScope(
   })
   const startup = new LinuxScopeStartup(files, 'subprocess')
   const unitBase = unitStem('dsh-subprocess')
+  const environment = runnerEnvironment(files.requestPath, invocation)
+  const systemdRun = configuredLinuxExecutable(internals.systemdRun ?? 'systemd-run', environment)
+  const systemctl = configuredLinuxExecutable(internals.systemctl ?? 'systemctl', environment)
   let child: ReturnType<typeof spawn>
   try {
-    child = (internals.spawn ?? spawn)(internals.systemdRun ?? 'systemd-run', scopeArgs(
+    child = (internals.spawn ?? spawn)(systemdRun, scopeArgs(
       unitBase,
       invocation,
       spec.argv,
     ), {
       cwd: process.cwd(),
-      env: runnerEnvironment(files.requestPath, invocation),
+      env: environment,
       stdio: runnerStdio(spec, false),
       detached: true,
     })
@@ -596,7 +655,7 @@ export function launchLinuxScope(
       signal: signal => signalChildGroup(child, signal),
       settled: direct,
     },
-    internals.systemctl ?? 'systemctl',
+    systemctl,
     internals.spawnSync ?? spawnSync,
     internals.systemctlQuery ?? querySystemctl,
     internals.sleep ?? sleepWithAbort,
