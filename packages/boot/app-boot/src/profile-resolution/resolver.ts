@@ -692,22 +692,36 @@ export function installProfileResolution(
       }
       const routedParent = pathToFileURL(route.kind === 'fallback' ? route.entry.declarer : route.parent).href
       if (behavior === 'enforce') {
-        const previous = delegatedEsm
-        delegatedEsm = { parent: routedParent, request }
         const restoreImporter = (error: unknown): never => throwWithImporter(error, routedParent, parent)
         try {
-          let result: ResolveResult | Promise<ResolveResult>
+          // Let the active source launcher (tsx) project workspace packages before the
+          // resolver's raw Node method selects their published `exports` entry. Built
+          // launches have no source hook, so this remains the native package resolution.
+          let resolved: string
           try {
-            result = native(request, routedParent, attributes)
+            resolved = import.meta.resolve(request, routedParent)
           } catch (error) {
-            return restoreImporter(error)
+            const code = (error as NodeJS.ErrnoException).code
+            if (code !== 'ERR_MODULE_NOT_FOUND') return restoreImporter(error)
+            const previous = delegatedEsm
+            delegatedEsm = { parent: routedParent, request }
+            try {
+              const result = native(request, routedParent, attributes)
+              /* v8 ignore next -- Node 24+ resolves synchronously; the Node 22 matrix covers its Promise result */
+              if (result instanceof Promise) return result.catch(restoreImporter)
+              if (cacheable) state.esm = result
+              return result
+            } finally {
+              delegatedEsm = previous
+            }
           }
+          const result = native(resolved, routedParent, attributes)
           /* v8 ignore next -- Node 24+ resolves synchronously; the Node 22 matrix covers its Promise result */
           if (result instanceof Promise) return result.catch(restoreImporter)
           if (cacheable) state.esm = result
           return result
-        } finally {
-          delegatedEsm = previous
+        } catch (error) {
+          return restoreImporter(error)
         }
       }
       const actual = native(request, parent, attributes)

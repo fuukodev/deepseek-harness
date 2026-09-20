@@ -247,7 +247,7 @@ export function gatesForMode(selected: Mode): Gate[] {
     case 'ci-bench':
       return [pnpmScript('bench', 'test:bench', { label: 'performance benchmarks' })]
     case 'ci-snapshot':
-      return [ciBuildGate(), snapshotGate()]
+      return [ciBuildGate(), snapshotGate(), sourceSnapshotGate()]
     case 'ci-artifacts':
       return ciArtifactGates()
     case 'ci-consumers':
@@ -270,6 +270,7 @@ export function gatesForMode(selected: Mode): Gate[] {
         pnpmScript('issue-management', 'test:issue-management', { label: 'Issue management policy' }),
         pnpmScript('duplication', 'duplication'),
         snapshotGate(),
+        sourceSnapshotGate(),
         expectedOutputGate(),
         pnpmScript('build', 'build'),
         pnpmScript('build:web', 'build:web'),
@@ -325,6 +326,7 @@ function ciPrimaryGates(): Gate[] {
     ...coverageGates(),
     ...nodeCompatSmokeGates(),
     snapshotGate(),
+    sourceSnapshotGate(),
     ...docSyncLeafGates({
       docTypecheckNeeds: ['typert-contracts'],
       docTypecheckScript: 'doc-typecheck:contracts-ready',
@@ -461,6 +463,7 @@ function ciConsumerGates(): Gate[] {
     'publint',
     'lint-and-duplication',
     'snapshot',
+    'snapshot-source',
     'expected-output',
     'doc-typecheck',
     'node-next-types',
@@ -479,6 +482,7 @@ function ciConsumerGates(): Gate[] {
       needs: validatedBuild,
     }),
     snapshotGate(validatedBuild),
+    sourceSnapshotGate(validatedBuild),
     expectedOutputGate(validatedBuild),
     webSnapshotGate(validatedBuild, buildArtifactReaders),
     pnpmScript('doc-typecheck', 'doc-typecheck:contracts-ready', {
@@ -658,6 +662,24 @@ function coverageGates(): Gate[] {
 function snapshotGate(needs: string[] = ['build']): Gate {
   return pnpmScript('snapshot', 'test:snapshot', {
     env: { DSH_EXAMPLE_MODE: 'lib' },
+    needs,
+  })
+}
+
+// Keep one source-mode tool-call scenario in CI so source launches exercise the
+// profile resolver instead of only checking the TTY refusal smoke.
+function sourceSnapshotGate(needs: string[] = ['build']): Gate {
+  return pnpmExec('snapshot-source', [
+    'vitest',
+    'run',
+    '--config',
+    'vitest.snapshot.config.ts',
+    'snapshots/session/headless.snapshot.ts',
+    '-t',
+    'replays deepseek-messages-invalid-tool-history',
+  ], {
+    label: 'source snapshot regression',
+    env: { DSH_EXAMPLE_MODE: 'src' },
     needs,
   })
 }
