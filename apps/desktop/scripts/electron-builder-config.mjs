@@ -232,7 +232,13 @@ export function createElectronBuilderConfig(
     },
     linux: {
       category: 'Development',
+      // The installed CLI launcher and xdg registration locate the Electron binary by this fixed name.
+      executableName: 'dsh',
+      icon: fileURLToPath(new URL('../resources/icon.png', import.meta.url)),
       target: ['AppImage'],
+      desktop: {
+        entry: { Name: 'DeepSeek Harness', MimeType: 'x-scheme-handler/dsh;' },
+      },
     },
     nsis: {
       installerSidebar: join(buildPaths.root, 'installer-ui', 'uninstaller-sidebar.bmp'),

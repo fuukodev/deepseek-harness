@@ -12,7 +12,8 @@ import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 export interface FileCommandInstallation {
   readonly destination: string
   readonly launcher: string
-  readonly linkHelper: string
+  /** macOS-only hard-link helper; Linux preserves symlink identity through `link()`. */
+  readonly linkHelper?: string
 }
 
 type Entry = { readonly kind: 'symlink'; readonly fingerprint: string; readonly target: string }
@@ -157,9 +158,14 @@ async function restoreEntry(options: FileCommandInstallation, source: string, de
 }
 
 async function linkEntry(options: FileCommandInstallation, source: string, destination: string): Promise<void> {
-  // macOS Node link() follows symlinks; linkat preserves their identity and refuses occupied destinations.
-  if (process.platform === 'darwin') await promisify(execFile)(options.linkHelper, [source, destination])
-  else await link(source, destination)
+  // macOS Node link() follows symlinks; the helper uses linkat to preserve their identity and refuse
+  // occupied destinations. Linux link() already keeps symlink identity without following.
+  if (process.platform === 'darwin') {
+    if (options.linkHelper === undefined) throw new CommandInstallationError('EINVAL', 'The macOS link helper is unavailable.')
+    await promisify(execFile)(options.linkHelper, [source, destination])
+  } else {
+    await link(source, destination)
+  }
 }
 
 async function withdraw(options: FileCommandInstallation, destination: string, expected: Entry): Promise<string | undefined> {

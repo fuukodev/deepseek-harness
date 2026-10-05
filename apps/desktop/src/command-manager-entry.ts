@@ -1,6 +1,7 @@
 /** Private command-management worker; macOS mutation targets are fixed before elevation. */
 
 import { spawn } from 'node:child_process'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { CommandInstallationError, inspectFileCommand, installFileCommand, removeFileCommand } from './command-installation.ts'
@@ -20,6 +21,12 @@ try {
     const state = operation === 'inspect' ? await inspectFileCommand(options)
       : operation === 'install' ? await installFileCommand(options, fingerprint) : await removeFileCommand(options, fingerprint)
     process.stdout.write(JSON.stringify({ ok: true, state }) + '\n')
+  } else if (process.platform === 'linux') {
+    const options = { destination: join(homedir(), '.local', 'bin', 'dsh'),
+      launcher: join(resources, 'runtime', 'cli', 'bin', 'dsh') }
+    const state = operation === 'inspect' ? await inspectFileCommand(options)
+      : operation === 'install' ? await installFileCommand(options, fingerprint) : await removeFileCommand(options, fingerprint)
+    process.stdout.write(JSON.stringify({ ok: true, state }) + '\n')
   } else if (process.platform === 'win32') {
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR
     if (systemRoot === undefined) throw new CommandInstallationError('ENOENT', 'Windows system directory is unavailable.')
@@ -34,7 +41,7 @@ try {
     child.stdin.end(JSON.stringify({ operation, expected, directory: join(resources, 'runtime', 'cli', 'bin') }))
     process.exitCode = await exited ?? 1
   } else {
-    throw new CommandInstallationError('EUNSUPPORTED', 'Command installation is supported on macOS and Windows.')
+    throw new CommandInstallationError('EUNSUPPORTED', 'Command installation is supported on macOS, Windows, and Linux.')
   }
 } catch (error) {
   // osascript preserves stdout only when the command exits successfully; the response owns operation failures.
