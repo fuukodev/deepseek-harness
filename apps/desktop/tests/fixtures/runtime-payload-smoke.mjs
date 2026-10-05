@@ -128,8 +128,42 @@ function checkKoffi() {
   }
 }
 
-/** Encode and decode a pixel through the packaged libvips binary. */
+/** Path of the primary runtime's standalone Node beside the dsh payload. */
+function standaloneNode() {
+  return join(resourcesRuntime, 'primary-runtime', 'dependencies', 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node')
+}
+
+/**
+ * Encode and decode a pixel through the packaged libvips binary.
+ * On Linux, Electron leaks globally installed glib symbols that crash libvips
+ * (electron#46323), so the packaged sharp binaries run under the standalone
+ * Node runtime that the Host's package processes use.
+ */
 async function checkSharp() {
+  if (process.platform === 'linux') {
+    // This fixture runs under Electron, whose fs reads ASAR; the standalone-Node
+    // child cannot, so a packaged payload resolves sharp beside the archive.
+    const sharpRoot = root.replace('app.asar', 'app.asar.unpacked')
+    const script = join(scratch, 'sharp.cjs')
+    writeFileSync(script, `
+const sharp = require(${JSON.stringify(join(sharpRoot, 'node_modules', 'sharp'))})
+const pixel = Buffer.from([17, 103, 231])
+sharp(pixel, { raw: { width: 1, height: 1, channels: 3 } }).png().toBuffer()
+  .then(png => sharp(png).raw().toBuffer({ resolveWithObject: true }))
+  .then(decoded => {
+    const assert = require('node:assert/strict')
+    assert.equal(decoded.info.width, 1)
+    assert.equal(decoded.info.height, 1)
+    assert.equal(decoded.info.channels, 3)
+    assert.deepEqual([...decoded.data], [...pixel])
+    console.log('runtime-payload-sharp-ok')
+  })
+  .catch(error => { console.error(error); process.exit(1) })
+`, { flag: 'wx', mode: 0o600 })
+    const output = execFileSync(standaloneNode(), [script], { encoding: 'utf8', timeout: 45_000 })
+    assert.match(output, /runtime-payload-sharp-ok/u)
+    return
+  }
   const sharp = requireRuntime('sharp')
   const pixel = Buffer.from([17, 103, 231])
   const png = await sharp(pixel, { raw: { width: 1, height: 1, channels: 3 } }).png().toBuffer()

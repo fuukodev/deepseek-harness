@@ -70,7 +70,7 @@ export function createElectronBuilderConfig(
   let dshDestination
   let windowsCode = []
   const unpack = ['**/*.{node,dylib,dll,so,exe}', '**/*.so.*', '**/spawn-helper', '**/@vscode/ripgrep-*/bin/rg',
-    `**/node_modules/@deepseek-ai/libreoffice-kit-${resolvedPlatform}-${resolvedArch}/**/*`]
+    `**/node_modules/@deepseek-ai/libreoffice-kit-${resolvedPlatform}-${resolvedArch}*/**/*`]
   const windowsSigner = packagesWindows && !unsigned
     ? createWindowsTokenSigner({
         certificateFile: env.DSH_DESKTOP_WINDOWS_CER_FILE,
@@ -236,6 +236,13 @@ export function createElectronBuilderConfig(
       executableName: 'dsh',
       icon: fileURLToPath(new URL('../resources/icon.png', import.meta.url)),
       target: ['AppImage'],
+      // Electron's Linux glib linkage crashes libvips inside the ASAR archive, and the
+      // standalone-Node smoke cannot read ASAR; keep sharp beside it instead. LibreOfficeKit's
+      // native-engine probe lstats candidate paths that ASAR reports as existing, so without
+      // unpacking, its wasm fallback never runs; unpacked JavaScript probes real paths.
+      asarUnpack: ['**/node_modules/sharp/**/*', '**/node_modules/@img/**/*',
+        '**/node_modules/@deepseek-ai/libreoffice-kit/**/*',
+        '**/node_modules/@deepseek-ai/dsh-office-to-pdf/**/*'],
       desktop: {
         entry: { Name: 'DeepSeek Harness', MimeType: 'x-scheme-handler/dsh;' },
       },

@@ -1,0 +1,19 @@
+diff --git a/lib/index.js b/lib/index.js
+index aac18a01c09916f51a76ceb81e47f75109d8497b..2419fe1daf8c3083c19627b9cb45670374fc8f9c 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1481,7 +1481,13 @@ const ENGINE_PREFIX = "@deepseek-ai/libreoffice-kit";
+ * @returns true when at least one resolution directory holds the package.
+ */
+ function installedPackageExists(name) {
+-	return (require.resolve.paths(name) ?? []).some((directory) => lstatSync(join(directory, name), { throwIfNoEntry: false }) !== void 0);
++	// Electron's ASAR filesystem reports lstat success for every path inside the archive,
++	// so a probe over archive paths would always claim the optional native engine is
++	// installed. Absent resolution is authoritative there: resolveEngine already treats it
++	// as absent and falls back to the wasm engine.
++	const candidates = require.resolve.paths(name) ?? [];
++	if (candidates.some((directory) => directory.includes("app.asar"))) return false;
++	return candidates.some((directory) => lstatSync(join(directory, name), { throwIfNoEntry: false }) !== void 0);
+ }
+ /**
+ * Return the optional package target for the current process ABI.

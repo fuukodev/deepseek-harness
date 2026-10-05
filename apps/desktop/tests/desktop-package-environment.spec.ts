@@ -139,6 +139,18 @@ describe('Desktop local packaging configuration', () => {
     }).not.toThrow()
   })
 
+  it('accepts shared release settings alone for a Linux target without signing credentials', () => {
+    expect(() => {
+      validateDesktopPackageEnvironment(RELEASE, { platform: 'linux', arch: 'x64' })
+    }).not.toThrow()
+    expect(() => {
+      validateDesktopPackageEnvironment({ ...MAC_IDENTITY, ...RELEASE }, { platform: 'linux', arch: 'x64' })
+    }).not.toThrow()
+    expect(() => {
+      validateDesktopPackageEnvironment({ ...RELEASE, DOWNLOAD_TEST_RELEASE_ID: 'short' }, { platform: 'linux', arch: 'x64' })
+    }).toThrow(/DOWNLOAD_TEST_RELEASE_ID/u)
+  })
+
   it('accepts one local npm registry mirror and rejects other registry forms', () => {
     const release = { ...POLICY, DSH_DESKTOP_APP_ID: RELEASE.DSH_DESKTOP_APP_ID }
     expect(() => {
