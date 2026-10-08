@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.1-alpha.1/pi-ai-provider-route-rename/guide.md
+/:
+  en: 95b100aac5dcadc5
+  zh: 945701efc3ba1acd
+/azure-replaces-azure-openai-responses-as-the-azure-provider-route:
+  en: 84be35d7b5111394
+  zh: 21aa6c532aa03343
+/azure-replaces-azure-openai-responses-as-the-azure-provider-route/change:
+  en: 65de3004f0d73608
+  zh: f7efe5edf9bde976
+/azure-replaces-azure-openai-responses-as-the-azure-provider-route/migration:
+  en: d83fb69fef8a9a54
+  zh: 235512933ea3bbea
