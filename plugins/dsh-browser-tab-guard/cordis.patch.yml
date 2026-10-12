@@ -1,0 +1,4 @@
+- insert:
+    - id: browser-tab-guard
+      name: '@local/dsh-browser-tab-guard'
+      config: {}
